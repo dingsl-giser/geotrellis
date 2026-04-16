@@ -32,6 +32,8 @@ import geotrellis.vector.{Extent, Point}
 import monocle.syntax.apply._
 import spire.syntax.cfor._
 
+import java.nio.file.{Files, Paths}
+
 import org.scalatest.{BeforeAndAfterAll, Inspectors}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -567,6 +569,17 @@ class GeoTiffReaderSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll 
   describe("handling special CRS cases") {
     it("can handle an ESRI written GeoTiff in WebMercator") {
       val tif = SinglebandGeoTiff(s"$baseDataPath/propval_bg_01_01.tif")
+      tif.crs should be (WebMercator)
+    }
+
+    it("can read anhui90c.tif as WebMercator") {
+      val path = "E:/tmp/hadoop-dingsl/singleTiffDataStore/anhui90c.tif"
+
+      if (!Files.exists(Paths.get(path))) {
+        cancel(s"Test GeoTiff not found: $path")
+      }
+
+      val tif = SinglebandGeoTiff(path)
       tif.crs should be (WebMercator)
     }
   }
