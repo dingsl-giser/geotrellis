@@ -36,6 +36,7 @@ import spire.syntax.cfor._
 import TagCodes._
 import TiffFieldType._
 import xml._
+import scala.util.Try
 
 @Lenses("_")
 case class TiffTags(
@@ -336,32 +337,13 @@ case class TiffTags(
   def proj4String: Option[String] =
     geoTiffCSTags.flatMap(_.getProj4String)
 
-  lazy val crs: CRS = {
-    val fromCode: Option[CRS] =
-      geoTiffCSTags.flatMap { csTags =>
-        csTags.model match {
-          case ModelTypeProjected =>
-            val pcs = csTags.pcs
-            if (pcs != UserDefinedProjectionType)
-              Some(CRS.fromName(s"EPSG:${pcs}"))
-            else
-              None
-          case ModelTypeGeographic =>
-            val gcs = csTags.gcs
-            if (gcs != UserDefinedProjectionType)
-              Some(CRS.fromName(s"EPSG:${gcs}"))
-            else
-              None
-          case _ => None
-        }
-      }
-    fromCode.getOrElse({
-      proj4String match {
-        case Some(s) => CRS.fromString(s)
-        case None => LatLng
-      }
-    })
-  }
+  lazy val crsOption: Option[CRS] =
+    crsFromGeoKeys
+      .orElse(proj4String.map(CRS.fromString))
+      .orElse(crsFromMetadata)
+
+  lazy val crs: CRS =
+    crsOption.getOrElse(LatLng)
 
   private def getRasterBoundaries: Array[Pixel3D] = {
     val imageWidth = cols
@@ -473,6 +455,119 @@ case class TiffTags(
 
   private lazy val geoTiffCSTags: Option[GeoTiffCSParser] =
     geoTiffTags.geoKeyDirectory.map(GeoTiffCSParser(_))
+
+  private def crsFromGeoKeys: Option[CRS] =
+    geoTiffCSTags.flatMap { csTags =>
+      csTags.model match {
+        case ModelTypeProjected =>
+          val pcs = csTags.pcs
+          if (pcs != UserDefinedProjectionType)
+            Some(CRS.fromName(s"EPSG:${pcs}"))
+          else
+            None
+        case ModelTypeGeographic =>
+          val gcs = csTags.gcs
+          if (gcs != UserDefinedProjectionType)
+            Some(CRS.fromName(s"EPSG:${gcs}"))
+          else
+            None
+        case _ => None
+      }
+    }
+
+  private def crsFromMetadata: Option[CRS] =
+    crsMetadataCandidates.view.flatMap(parseCRSFromText).headOption
+
+  private def crsMetadataCandidates: Seq[String] = {
+    val base = Seq(
+      geoTiffTags.metadata,
+      metadataTags.imageDesc,
+      geoTiffTags.asciis
+    ).flatten.map(_.trim).filter(_.nonEmpty)
+
+    val fromXml = geoTiffTags.metadata.toSeq.flatMap(extractCRSMetadataTexts)
+
+    (base ++ fromXml).distinct
+  }
+
+  private def extractCRSMetadataTexts(metadata: String): Seq[String] =
+    Try(XML.loadString(metadata.trim)).toOption.toSeq.flatMap { xml =>
+      (xml \\ "Item")
+        .flatMap { node =>
+          val name = (node \ "@name").text.trim.toLowerCase
+          val text = node.text.trim
+          if (
+            text.nonEmpty && (
+              name.contains("esri") ||
+              name.contains("wkt") ||
+              name.contains("srs") ||
+              name.contains("proj")
+            )
+          ) Some(text)
+          else None
+        }
+    }
+
+  private def parseCRSFromText(text: String): Option[CRS] = {
+    val normalized = text.toLowerCase
+
+    def fromEpsgMentions: Option[CRS] = {
+      val epsgRegexes = Seq(
+        """epsg\s*:\s*(\d{4,5})""".r,
+        """epsg"\s*,\s*"(\d{4,5})""".r
+      )
+
+      epsgRegexes.view.flatMap { regex =>
+        regex.findFirstMatchIn(normalized).flatMap { m =>
+          Try(CRS.fromEpsgCode(m.group(1).toInt)).toOption
+        }
+      }.headOption
+    }
+
+    def fromKnownNames: Option[CRS] =
+      if (
+        normalized.contains("wgs 84 / pseudo-mercator") ||
+        normalized.contains("wgs_1984_web_mercator_auxiliary_sphere") ||
+        normalized.contains("mercator_auxiliary_sphere") ||
+        normalized.contains("pseudo-mercator") ||
+        normalized.contains("web mercator")
+      ) Some(CRS.fromEpsgCode(3857))
+      else None
+
+    fromEpsgMentions
+      .orElse(extractWKT(text).flatMap(CRS.fromWKT))
+      .orElse(fromKnownNames)
+  }
+
+  private def extractWKT(text: String): Option[String] = {
+    val candidates = Seq("PROJCS[", "GEOGCS[")
+
+    candidates.view.flatMap { token =>
+      val start = text.indexOf(token)
+      if (start >= 0) {
+        val end = balancedBracketEnd(text, start + token.length - 1)
+        if (end > start) Some(text.substring(start, end + 1)) else None
+      } else None
+    }.headOption
+  }
+
+  private def balancedBracketEnd(text: String, openBracketIndex: Int): Int = {
+    var depth = 0
+    var i = openBracketIndex
+
+    while (i < text.length) {
+      text.charAt(i) match {
+        case '[' => depth += 1
+        case ']' =>
+          depth -= 1
+          if (depth == 0) return i
+        case _ =>
+      }
+      i += 1
+    }
+
+    -1
+  }
 
   def tags: Tags = {
     var (headTags, bandTags) =
